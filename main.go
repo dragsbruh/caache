@@ -81,9 +81,9 @@ func main() {
 }
 
 func Router(ctx context.Context, imagesDir string, sf *singleflight.Group) http.Handler {
-	r := http.NewServeMux()
+	router := http.NewServeMux()
 
-	r.HandleFunc("/{record_type}/{mbid}/{size}", func(w http.ResponseWriter, r *http.Request) {
+	router.HandleFunc("GET /{record_type}/{mbid}/{size}", func(w http.ResponseWriter, r *http.Request) {
 		recordType := r.PathValue("record_type")
 		sizeStr := r.PathValue("size")
 		mbid := r.PathValue("mbid")
@@ -108,7 +108,7 @@ func Router(ctx context.Context, imagesDir string, sf *singleflight.Group) http.
 		if err == nil {
 			defer file.Close()
 
-			PutHeaders(w)
+			PutImageHeaders(w)
 			if _, err := io.Copy(w, file); err != nil {
 				log.Err(err).Str("file", imagePath).Msg("error streaming file")
 			}
@@ -158,11 +158,11 @@ func Router(ctx context.Context, imagesDir string, sf *singleflight.Group) http.
 		}
 		defer file.Close()
 
-		PutHeaders(w)
+		PutImageHeaders(w)
 		io.Copy(w, file)
 	})
 
-	r.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
+	router.HandleFunc("GET /cache", func(w http.ResponseWriter, r *http.Request) {
 		releaseEntries, err := os.ReadDir(filepath.Join(imagesDir, "release"))
 		if err != nil {
 			log.Err(err).Msg("couldnt read release directory")
@@ -193,18 +193,33 @@ func Router(ctx context.Context, imagesDir string, sf *singleflight.Group) http.
 		}
 	})
 
-	return r
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		PutCorsHeaders(w)
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		router.ServeHTTP(w, r)
+	})
 }
 
-func PutHeaders(w http.ResponseWriter) {
+// sets image/jpeg and cache headers
+func PutImageHeaders(w http.ResponseWriter) {
 	w.Header().Set("content-type", "image/jpeg")
 	w.Header().Set("cache-control", "public, max-age=31536000, immutable")
+}
 
+func PutCorsHeaders(w http.ResponseWriter) {
 	w.Header().Set("access-control-allow-origin", "*")
 	w.Header().Set("access-control-allow-methods", "GET, OPTIONS")
 	w.Header().Set("access-control-max-age", "86400")
 }
 
+// saves all sizes, original as original in imagesDir/recordType/mbid/<size>.jpg
+// will still do it if files already exist, idk if its a good thing or not
+// saves initially to tmp file so should be good if we have to exit or smth
 // returns status code or nil as first return arg
 func FetchImage(ctx context.Context, imagesDir, recordType, mbid string) (any, error) {
 	url := fmt.Sprintf("https://coverartarchive.org/%s/%s/front", recordType, mbid)
@@ -252,7 +267,7 @@ func FetchImage(ctx context.Context, imagesDir, recordType, mbid string) (any, e
 		file.Close()
 	}
 
-	log.Debug().Msg("renaming tmp files")
+	log.Debug().Str("mbid", mbid).Msg("renaming tmp files")
 	for _, size := range imageSizes {
 		imagePath := PathOf(imagesDir, recordType, mbid, size)
 
@@ -264,6 +279,7 @@ func FetchImage(ctx context.Context, imagesDir, recordType, mbid string) (any, e
 	return nil, nil
 }
 
+// replaces any size `0` with `original` and returns `imagesDir/recordType/mbid/size.jpg`
 func PathOf[T int | string](imagesDir, recordType, mbid string, size T) string {
 	sizeStr := "original"
 

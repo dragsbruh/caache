@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,12 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+var imageSizes = []int{0, 1024, 512, 256, 128}
+var defaultAddr = ":80"
+var httpClient = &http.Client{
+	Timeout: time.Second * 60, // this can be slow on certain images if theyre large, so i made it a minute
+}
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -31,7 +38,7 @@ func main() {
 
 	addr := os.Getenv("ADDR")
 	if addr == "" {
-		addr = ":80"
+		addr = defaultAddr
 	}
 
 	imagesDir := os.Getenv("IMAGES_DIR")
@@ -40,6 +47,13 @@ func main() {
 	}
 
 	sf := singleflight.Group{}
+
+	if err := os.MkdirAll(filepath.Join(imagesDir, "release"), 0755); err != nil {
+		log.Fatal().Err(err).Msg("couldnt create release dir")
+	}
+	if err := os.MkdirAll(filepath.Join(imagesDir, "release-group"), 0755); err != nil {
+		log.Fatal().Err(err).Msg("couldnt create release-group dir")
+	}
 
 	server := http.Server{
 		Addr:    addr,
@@ -69,31 +83,35 @@ func main() {
 func Router(ctx context.Context, imagesDir string, sf *singleflight.Group) http.Handler {
 	r := http.NewServeMux()
 
-	httpClient := &http.Client{
-		Timeout: time.Second * 15,
-	}
-
-	r.HandleFunc("/{record_type}/{mbid}", func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/{record_type}/{mbid}/{size}", func(w http.ResponseWriter, r *http.Request) {
 		recordType := r.PathValue("record_type")
+		sizeStr := r.PathValue("size")
 		mbid := r.PathValue("mbid")
 
 		if recordType != "release" && recordType != "release-group" {
 			w.WriteHeader(400)
+			w.Write([]byte("expected `release` or `release-group` record type"))
 			return
 		}
 
-		imagePath := filepath.Join(imagesDir, recordType, fmt.Sprintf("%s.jpg", mbid))
+		switch sizeStr {
+		case "128", "256", "512", "1024", "original":
+		default:
+			w.WriteHeader(400)
+			w.Write([]byte("expected `128`, `256`, `512`, `1024` or `original` size query"))
+			return
+		}
+
+		imagePath := PathOf(imagesDir, recordType, mbid, sizeStr)
 
 		file, err := os.Open(imagePath)
 		if err == nil {
 			defer file.Close()
 
 			PutHeaders(w)
-
 			if _, err := io.Copy(w, file); err != nil {
 				log.Err(err).Str("file", imagePath).Msg("error streaming file")
 			}
-
 			return
 		} else if !os.IsNotExist(err) {
 			log.Err(err).Str("file", imagePath).Msg("error opening file")
@@ -101,10 +119,7 @@ func Router(ctx context.Context, imagesDir string, sf *singleflight.Group) http.
 			return
 		}
 
-		url := fmt.Sprintf("https://coverartarchive.org/%s/%s/front-250", recordType, mbid)
-		log.Debug().Str("url", url).Msg("fetching image from upstream")
-
-		statusCode, err, _ := sf.Do(imagePath, func() (any, error) {
+		statusCode, err, _ := sf.Do(fmt.Sprint(recordType, mbid), func() (any, error) {
 			_, err := os.Stat(imagePath)
 			if err == nil {
 				return nil, nil
@@ -112,68 +127,70 @@ func Router(ctx context.Context, imagesDir string, sf *singleflight.Group) http.
 				return nil, fmt.Errorf("error stat-ing sf'd image: %w", err)
 			}
 
-			// intended use of root context here because i dont trust requests to stay long enough sometimes, lets just cache it and move on
-			req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-
-			resp, err := httpClient.Do(req)
-			if err != nil {
-				return nil, fmt.Errorf("error getting caa image: %w", err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				return resp.StatusCode, nil
-			}
-
 			if err := os.MkdirAll(filepath.Dir(imagePath), 0755); err != nil {
 				return nil, fmt.Errorf("error making directory: %w", err)
 			}
 
-			img, err := imaging.Decode(resp.Body)
+			statusCode, err := FetchImage(ctx, imagesDir, recordType, mbid)
 			if err != nil {
-				return nil, fmt.Errorf("error decoding image: %w", err)
+				return nil, fmt.Errorf("error fetching images: %w", err)
 			}
 
-			file, err = os.Create(imagePath + ".tmp")
-			if err != nil {
-				return nil, fmt.Errorf("error creating temp file: %w", err)
-			}
-			defer file.Close()
-
-			resized := imaging.Resize(img, 128, 128, imaging.Lanczos)
-
-			if err := imaging.Encode(file, resized, imaging.JPEG); err != nil {
-				return nil, fmt.Errorf("error encoding image: %w", err)
-			}
-
-			if err := os.Rename(imagePath+".tmp", imagePath); err != nil {
-				return nil, fmt.Errorf("error renaming tmp to real: %w", err)
-			}
-
-			return nil, nil
+			return statusCode, nil
 		})
-
 		if err != nil {
-			log.Err(err).Str("url", url).Str("file", imagePath).Msg("error in cache miss")
+			log.Err(err).Str("file", imagePath).Msg("error in cache miss")
 			w.WriteHeader(500)
 			return
 		}
 
 		if statusCode != nil {
-			log.Debug().Int("status_code", statusCode.(int)).Msg("forwarding caa's non-200 status code")
+			log.Warn().Int("status_code", statusCode.(int)).Msg("forwarding caa's non-200 status code")
 			w.WriteHeader(statusCode.(int))
 			return
 		}
 
 		file, err = os.Open(imagePath)
 		if err != nil {
-			log.Err(err).Str("url", url).Str("file", imagePath).Msg("cannot access image in miss")
+			log.Err(err).Str("file", imagePath).Msg("cannot access image in miss")
+			w.WriteHeader(500)
+			return
+		}
+		defer file.Close()
+
+		PutHeaders(w)
+		io.Copy(w, file)
+	})
+
+	r.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
+		releaseEntries, err := os.ReadDir(filepath.Join(imagesDir, "release"))
+		if err != nil {
+			log.Err(err).Msg("couldnt read release directory")
+			w.WriteHeader(500)
+			return
+		}
+		releaseGroupEntries, err := os.ReadDir(filepath.Join(imagesDir, "release-group"))
+		if err != nil {
+			log.Err(err).Msg("couldnt read release-group directory")
 			w.WriteHeader(500)
 			return
 		}
 
-		PutHeaders(w)
-		io.Copy(w, file)
+		cacheStatus := map[string][]string{}
+		for _, release := range releaseEntries {
+			cacheStatus["release"] = append(cacheStatus["release"], release.Name())
+		}
+		for _, release := range releaseGroupEntries {
+			cacheStatus["release-group"] = append(cacheStatus["release-group"], release.Name())
+		}
+
+		w.Header().Set("content-type", "application/json")
+		w.Header().Set("access-control-allow-origin", "*")
+
+		if err := json.NewEncoder(w).Encode(cacheStatus); err != nil {
+			log.Err(err).Msg("error encoding cache status json")
+			return
+		}
 	})
 
 	return r
@@ -185,7 +202,82 @@ func PutHeaders(w http.ResponseWriter) {
 
 	w.Header().Set("access-control-allow-origin", "*")
 	w.Header().Set("access-control-allow-methods", "GET, OPTIONS")
-	w.Header().Set("access-control-allow-headers", "*")
-	w.Header().Set("access-control-expose-headers", "*")
 	w.Header().Set("access-control-max-age", "86400")
+}
+
+// returns status code or nil as first return arg
+func FetchImage(ctx context.Context, imagesDir, recordType, mbid string) (any, error) {
+	url := fmt.Sprintf("https://coverartarchive.org/%s/%s/front", recordType, mbid)
+	log.Debug().Str("url", url).Str("mbid", mbid).Msg("fetching image from upstream")
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error getting caa image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Debug().Str("mbid", mbid).Int("status_code", resp.StatusCode).Msg("received non-200 status code from upstream")
+		return resp.StatusCode, nil
+	}
+
+	log.Debug().Str("mbid", mbid).Msg("decoding image")
+	img, err := imaging.Decode(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding image: %w", err)
+	}
+
+	for _, size := range imageSizes {
+		imagePath := PathOf(imagesDir, recordType, mbid, size)
+
+		file, err := os.Create(imagePath + ".tmp")
+		if err != nil {
+			return nil, fmt.Errorf("error creating temp file: %w", err)
+		}
+
+		log.Debug().Str("mbid", mbid).Int("size", size).Msg("encoding to new resolution")
+
+		if size != 0 { // 0 = save original
+			// this might appear dangerous but since order of sizes is decreasing this is actually more performant on high load
+			img = imaging.Resize(img, size, size, imaging.Lanczos)
+		}
+
+		if err := imaging.Encode(file, img, imaging.JPEG); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("error encoding image: %w", err)
+		}
+
+		file.Close()
+	}
+
+	log.Debug().Msg("renaming tmp files")
+	for _, size := range imageSizes {
+		imagePath := PathOf(imagesDir, recordType, mbid, size)
+
+		if err := os.Rename(imagePath+".tmp", imagePath); err != nil {
+			return nil, fmt.Errorf("error renaming tmp to real: %w", err)
+		}
+	}
+
+	return nil, nil
+}
+
+func PathOf[T int | string](imagesDir, recordType, mbid string, size T) string {
+	sizeStr := "original"
+
+	switch v := any(size).(type) {
+	case string:
+		if v != "0" {
+			sizeStr = v
+		}
+	case int:
+		if v != 0 {
+			sizeStr = fmt.Sprint(v)
+		}
+	default:
+	}
+
+	return filepath.Join(imagesDir, recordType, mbid, sizeStr+".jpg")
 }

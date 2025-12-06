@@ -1,0 +1,13 @@
+services:
+  caache:
+    image: ghcr.io/dragsbruh/caache:latest
+    restart: unless-stopped
+
+    volumes:
+      - ./images:/images
+
+    environment:
+      - IMAGES_DIR=/images
+
+    ports:
+      - 8080:80

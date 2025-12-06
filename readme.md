@@ -1,6 +1,6 @@
 # caache
 
-[coverartarchive](https://coverartarchive.org) proxy that caches images
+[**c**over**a**rt**a**rchive](https://coverartarchive.org) proxy that ca**che**s images
 
 ## installation
 
@@ -26,7 +26,8 @@ configuration is done via env variables
 
 - cache header is set on cover art responses with max age 365 days
 - cached images are permanent until manually removed
-- cors is enabled for all get requests
+- cors is enabled for all get and preflight requests
+- available resolutions: `128`, `256`, `512`, `1024`, `original`
 
 ## usage
 
@@ -60,16 +61,22 @@ services:
 
 ### api
 
-similar to the real coverartarchive
+#### `/{release|release-group}/{mbid}/{resolution}`
 
-```
-http://localhost:8080/{record-type}/{mbid}
-http://localhost:8080/release/60b529f1-f99b-499f-9b3d-e96f9971039e
+similar to the real coverartarchive, but with different resolution options
+
+```sh
+http://localhost:8080/release/60b529f1-f99b-499f-9b3d-e96f9971039e/256
+http://localhost:8080/release/60b529f1-f99b-499f-9b3d-e96f9971039e/1024
+http://localhost:8080/release/58a1c084-332d-4012-86af-88b0cf8e47a7/original # original is whatever size is on /front of caa api
 ```
 
-need to add support for multiple sizes including 128x128, 250x250, 500x500, 1200x1200.
-sizes are basically all caa supported + 128x128 because yes. currently only 128x128 is served.
+multiple sizes are available, including `128x128`, `256x256`, `512x512`, `1024x1024`, and `original`.
+
+when an image is not cached in disk, the original (full res) image is
+requested from caa and is downscaled to all supported resolutions.
 
 ## todo
 
-- [ ] allow multiple resolutions
+- [x] allow multiple resolutions
+- [ ] support back images too (? idk if thats needed for my personal use but might do it later if im free)
